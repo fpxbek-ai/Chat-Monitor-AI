@@ -1,18 +1,17 @@
+; Copy to config.ini locally. Never commit config.ini.
+; Secrets belong in CHAT_MONITOR_* environment variables; see README_TEST_MODE_RU.md.
 [telegram]
-token = ""
-user_id = ""
+user_id = 0
 
 [timezone]
-name = "Europe/Moscow"
-
-[settings]
-language = "ru"
+name = Asia/Tashkent
 
 [tdlib]
-api_id     = ""
-api_hash   = ""
-phone      = "+7**********"
-password   = ""
-tdjson_path = "tdjson.dll"
-; auth_mode: qr (scan QR via Telegram app, default) or code (SMS/app code)
-auth_mode  = "qr"
+tdjson_path = /path/to/libtdjson.so
+auth_mode = qr
+
+[monitor]
+; Exactly one permitted negative test-group ID. Empty means monitoring disabled.
+chat_ids =
+; Numeric ID of the separate TEST account. Zero blocks startup.
+test_user_id = 0

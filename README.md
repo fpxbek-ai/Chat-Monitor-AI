@@ -1,3 +1,11 @@
+# Chat Monitor AI — test-group mode
+
+This working copy monitors only one explicitly allowed test group.
+The upstream description below does not describe the current safety restrictions.
+See README_TEST_MODE_RU.md for current setup and offline verification.
+
+---
+
 # all-seeing Telegram Bot
 
 A Telegram userbot that monitors your private chats and notifies you about **edited** and **deleted** messages — including media. Built on [TDLib](https://core.telegram.org/tdlib) via [aiotdlib](https://github.com/pylakey/aiotdlib), running as a regular user account with no Business subscription required.

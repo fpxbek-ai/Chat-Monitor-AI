@@ -4,8 +4,8 @@ tdlib_userbot.py
 TDLib userbot singleton. Handles:
   - login / auth
   - gift enumeration and upgrade
-  - message tracking: new / edited / deleted (replaces Business Bot API)
-  - self-destructing message forwarding
+  - allowlisted message tracking: new / edited / deleted
+  - NO automatic forwarding of disappearing messages or media downloads
 
 Uses raw TDLib API via aiotdlib for maximum speed.
 """
@@ -126,15 +126,15 @@ def _patched_core_init(self, library_path):
     self._td_execute.restype = ctypes.c_char_p
     self._td_execute.argtypes = [ctypes.c_char_p]
 
-    try:
-        from aiotdlib.tdjson import LogMessageCallback
-        self._td_set_log_message_callback = self._tdjson.td_set_log_message_callback
-        self._td_set_log_message_callback.restype = None
-        self._td_set_log_message_callback.argtypes = [LogMessageCallback]
-        self._td_set_log_message_callback(LogMessageCallback(self.__log_message_callback))
-        self.logger.debug("td_set_log_message_callback registered successfully")
-    except (OSError, AttributeError) as e:
-        self.logger.warning("td_set_log_message_callback not available in this DLL build: %s", e)
+    # Official TDLib ABI: (int max_verbosity_level, callback).
+    # Keep the callback alive; never emit native account data into logs.
+    callback_type = ctypes.CFUNCTYPE(None, ctypes.c_int, ctypes.c_char_p)
+    self._log_callback = callback_type(lambda level, message: None)
+    self._td_set_log_message_callback = self._tdjson.td_set_log_message_callback
+    self._td_set_log_message_callback.restype = None
+    self._td_set_log_message_callback.argtypes = [ctypes.c_int, callback_type]
+    self._td_set_log_message_callback(0, self._log_callback)
+    self._td_execute(b'{"@type":"setLogVerbosityLevel","new_verbosity_level":0}')
 
 
 _CoreTDJson.__init__ = _patched_core_init
@@ -273,8 +273,15 @@ class TdlibUserbot:
             phone_number=phone_number,
             library_path=tdjson_path,
             password=password,
+            files_directory=os.path.abspath(".chat-monitor-test"),
+            use_secret_chats=False,
+            use_message_database=False,
+            use_chat_info_database=False,
+            use_file_database=False,
         )
         self.client: Client | None = None
+        self._tracking_ready = False
+        self.expected_test_user_id = None
 
     @staticmethod
     def _make_tty_input(prompt: str, *, secured: bool = False) -> str:
@@ -349,8 +356,7 @@ class TdlibUserbot:
                     from aiotdlib.api import RequestQrCodeAuthentication
                     await self_.send(RequestQrCodeAuthentication(other_user_ids=[]))
                 except Exception as e:
-                    logger.warning("requestQrCodeAuthentication failed (%s), falling back to phone", e)
-                    await _orig_on_auth_state(authorization_state)
+                    raise RuntimeError("QR authentication failed; phone fallback is disabled") from None
                 return
 
             # Handle QR link (both modes: TDLib 1.8+ may send this regardless)
@@ -393,22 +399,31 @@ class TdlibUserbot:
             pass  # qrcode not installed — just show the link below
 
         # Always print the raw link so user can open/copy it if QR is inconvenient
-        sys.stdout.write(f"🔗 Link: {link}\n")
+        # Authentication links must never be printed into persistent logs.
         sys.stdout.write("⏳ QR refreshes automatically every ~30s. Scan whenever ready.\n")
         sys.stdout.flush()
 
-    async def start(self, use_qr: bool = True) -> None:
+    async def start(self, use_qr: bool = True, on_client_created=None) -> None:
         """Start TDLib client (triggers auth on first run).
 
         Args:
             use_qr: If True (default), use QR-code auth. If False, use phone/SMS code.
         """
+        if not self.expected_test_user_id or self.expected_test_user_id <= 0:
+            raise RuntimeError("An explicit test account ID is required")
+        self._tracking_ready = False
         self.client = Client(settings=self._settings)
+        if on_client_created is not None:
+            on_client_created()  # Set allowlist handlers before authentication.
         self._patch_auth_input(use_qr=use_qr)
         self._ctx = self.client.__aenter__()
         await self._ctx
         me = await self.client.api.get_me()
-        logger.info("TDLib userbot logged in as %s (id=%d)", me.first_name, me.id)
+        if me.id != self.expected_test_user_id:
+            await self.stop()
+            raise RuntimeError("Account mismatch: monitoring refused")
+        self._tracking_ready = True
+        logger.info("Test account verified; allowlisted tracking enabled")
 
         # Stay offline: undo the online=True that aiotdlib sets during auth
         try:
@@ -423,6 +438,7 @@ class TdlibUserbot:
 
     async def stop(self) -> None:
         """Gracefully close TDLib client."""
+        self._tracking_ready = False
         if self.client:
             try:
                 await self.client.__aexit__(None, None, None)
@@ -575,377 +591,192 @@ class TdlibUserbot:
         aiogram_bot,
         notify_user_id: int,
         timezone_local,
-        edited_fmt: str,
-        deleted_fmt: str,
-        new_user_fmt: str,
-        self_destruct_fmt: str,
-        timer_immediately: str,
-        timer_seconds: str,
-        timer_fire: str,
-        media_unavailable: str,
-        media_unavailable_gone: str,
         messagesx_cls,
-        usersdb_cls,
         watched_chat_ids: Set[int] | None = None,
     ) -> None:
-        """
-        Wire up updateNewMessage / updateMessageEdited / updateDeleteMessages handlers.
-        Media is downloaded via TDLib's downloadFile and sent as local files.
-        Self-destructing messages are forwarded immediately upon receipt.
+        """Monitor explicitly allowed chats only.
+
+        The dedicated SQLite store is keyed by (chat_id, message_id), with
+        author_id saved separately. No auto-download or forwarding of media,
+        disappearing messages, or messages from unlisted chats.
         """
         from datetime import datetime, timezone
         from html import escape
 
         client = self.client
         if client is None:
-            raise RuntimeError("TDLib userbot not started — call start() first")
+            raise RuntimeError("Call after TDLib Client creation")
+        allowed = frozenset(watched_chat_ids or ())
+        if not allowed:
+            logger.warning("No allowed chat IDs; all message updates will be ignored")
 
-        # ── Notification sender ───────────────
-        async def _send_notification(
-            message_old: str,
-            message_new: str | None,
-            user_fullname: str,
-            user_id: int,
-            timestamp: str,
-            tdlib_file_id: int | None = None,
-            media_type: str = "text",
-        ) -> None:
-            """
-            Send edit/delete notification via aiogram bot.
-            If tdlib_file_id is set, file is downloaded via TDLib and sent as FSInputFile.
-            """
-            from aiogram.types import FSInputFile
+        # Both updateMessageEdited and updateMessageContent may occur for a
+        # single edit. Serial processing and comparing contents deduplicates.
+        change_lock = asyncio.Lock()
 
-            user_fullname_escaped = escape(user_fullname)
-            if message_new is None:
-                caption = deleted_fmt.format(
-                    user_fullname_escaped=user_fullname_escaped,
-                    user_id=user_id,
-                    timestamp=timestamp,
-                    old_text=message_old,
-                )
-            else:
-                caption = edited_fmt.format(
-                    user_fullname_escaped=user_fullname_escaped,
-                    user_id=user_id,
-                    timestamp=timestamp,
-                    old_text=message_old,
-                    new_text=message_new,
-                )
+        def permitted(chat_id) -> bool:
+            return self._tracking_ready and type(chat_id) is int and chat_id in allowed
 
-            try:
-                if tdlib_file_id and media_type != "text":
-                    local_path = await self._download_file(tdlib_file_id)
-                    if local_path and os.path.exists(local_path):
-                        input_file = FSInputFile(local_path)
-                        methods = {
-                            "photo":      aiogram_bot.send_photo,
-                            "video":      aiogram_bot.send_video,
-                            "voice":      aiogram_bot.send_voice,
-                            "video_note": aiogram_bot.send_video_note,
-                            "animation":  aiogram_bot.send_animation,
-                            "sticker":    aiogram_bot.send_sticker,
-                            "document":   aiogram_bot.send_document,
-                            "audio":      aiogram_bot.send_audio,
-                        }
-                        method = methods.get(media_type)
-                        if method:
-                            if media_type in ("video_note", "sticker"):
-                                await aiogram_bot.send_message(notify_user_id, caption, parse_mode="html")
-                                await method(notify_user_id, input_file)
-                            else:
-                                await method(notify_user_id, input_file, caption=caption, parse_mode="html")
-                            return
-                    # Fall through to text if download failed
-                    caption += media_unavailable
-
-                await aiogram_bot.send_message(notify_user_id, caption, parse_mode="html")
-
-            except Exception as e:
-                logger.error("Failed to send notification to user %d: %s", notify_user_id, e)
-
-        # ── Self-destruct forwarder ───────────
-        async def _forward_self_destruct(
-            msg_dict: dict,
-            user_fullname: str,
-            user_id: int,
-        ) -> None:
-            """Immediately download and forward a self-destructing message."""
-            from aiogram.types import FSInputFile
-
-            content = msg_dict.get("content", {})
-            tdlib_fid, media_type = _extract_tdlib_file(content)
+        def display_text(content) -> tuple[str, str]:
             text = _extract_text_from_content(content)
+            _fid, kind = _extract_tdlib_file(content)
+            if kind != "text":
+                text = f"[{kind}] {text}".strip()
+            return text, kind
 
-            sdt = msg_dict.get("self_destruct_type", {})
-            sdt_type = sdt.get("@type", "") if isinstance(sdt, dict) else ""
-            timer_s = sdt.get("self_destruct_time", 0) if isinstance(sdt, dict) else 0
+        def author_from_message(msg: dict) -> int | None:
+            sender = _as_dict(msg.get("sender_id"))
+            # TDLib represents user senders as messageSenderUser.
+            kind = sender.get("@type") or sender.get("ID")
+            if kind and kind != "messageSenderUser":
+                return None  # chat/anonymous sender: never misattribute
+            uid = sender.get("user_id")
+            if isinstance(uid, int) and uid > 0:
+                return uid
+            return None
 
-            if sdt_type == "messageSelfDestructTypeImmediately":
-                timer_label = timer_immediately
-            elif timer_s:
-                timer_label = timer_seconds.format(seconds=timer_s)
-            else:
-                timer_label = timer_fire
-
-            header = self_destruct_fmt.format(
-                timer_label=timer_label,
-                user_id=user_id,
-                user_fullname_escaped=escape(user_fullname),
-            )
-            if text:
-                header += f"\n{escape(text)}"
-
+        def display_timestamp(iso: str) -> str:
             try:
-                if tdlib_fid and media_type != "text":
-                    local_path = await self._download_file(tdlib_fid, timeout=60.0)
-                    if local_path and os.path.exists(local_path):
-                        input_file = FSInputFile(local_path)
-                        methods = {
-                            "photo":      aiogram_bot.send_photo,
-                            "video":      aiogram_bot.send_video,
-                            "voice":      aiogram_bot.send_voice,
-                            "video_note": aiogram_bot.send_video_note,
-                            "animation":  aiogram_bot.send_animation,
-                            "sticker":    aiogram_bot.send_sticker,
-                            "document":   aiogram_bot.send_document,
-                            "audio":      aiogram_bot.send_audio,
-                        }
-                        method = methods.get(media_type)
-                        if method:
-                            if media_type in ("video_note", "sticker"):
-                                await aiogram_bot.send_message(notify_user_id, header, parse_mode="html")
-                                await method(notify_user_id, input_file)
-                            else:
-                                await method(notify_user_id, input_file, caption=header, parse_mode="html")
-                            return
-                    header += media_unavailable_gone
+                return datetime.fromisoformat(iso).astimezone(timezone_local).strftime("%d.%m.%Y %H:%M")
+            except (TypeError, ValueError):
+                return "unknown"
 
-                await aiogram_bot.send_message(notify_user_id, header, parse_mode="html")
+        async def notify(*, chat_id: int, old: str, new: str | None, record) -> None:
+            # Escape all user-controlled text to prevent Telegram HTML failures.
+            old = escape((old or "(empty)")[:600] + ("…" if len(old or "") > 600 else ""))
+            author = escape((record.author_name or str(record.author_id))[:100])
+            prefix = (
+                f"{'✏️ Edited' if new is not None else '🗑 Deleted'} message\n"
+                f"Chat: <code>{chat_id}</code>\n"
+                f"Author: {author} (<code>{record.author_id}</code>)\n"
+                f"Original time: {display_timestamp(record.timestamp)}\n"
+            )
+            if new is None:
+                content = f"Before deletion: {old}"
+            else:
+                content = f"Before: {old}\nAfter: {escape((new or '(empty)')[:600] + ('…' if len(new or '') > 600 else ''))}"
+            msg = prefix + content
+            try:
+                await aiogram_bot.send_message(notify_user_id, msg, parse_mode="HTML")
+            except Exception:
+                logger.warning("Unable to deliver notification; stored version retained")
+                raise RuntimeError("Notification delivery failed") from None
 
-            except Exception as e:
-                logger.error("Failed to forward self-destruct from %d: %s", user_id, e)
-
-        # ── updateNewMessage ──────────────────
         @client.on_event(API.Types.UPDATE_NEW_MESSAGE)
-        async def _on_new_message(c: Client, update):
+        async def on_new_message(_client, update):
             try:
                 msg = getattr(update, "message", None)
-                if msg is None and hasattr(update, "data"):
-                    msg = update.data.get("message")
-                if not msg:
+                if msg is None:
+                    msg = _as_dict(update).get("message")
+                message = _as_dict(msg)
+                chat_id = message.get("chat_id")
+                msg_id = message.get("id")
+                if not permitted(chat_id) or not isinstance(msg_id, int) or not msg_id:
                     return
-
-                msg_d = _as_dict(msg)
-                chat_id = msg_d.get("chat_id")
-                message_id = msg_d.get("id")
-                date = msg_d.get("date")
-
-                if not chat_id or not message_id:
+                # Disappearing messages are excluded, not forwarded or stored.
+                if _is_self_destruct(message):
                     return
-                if chat_id <= 0:
-                    return  # only private chats
-                if watched_chat_ids and chat_id not in watched_chat_ids:
+                author_id = author_from_message(message)
+                if author_id is None:
+                    logger.debug("Ignoring non-user sender in chat %s", chat_id)
                     return
-
-                content = msg_d.get("content", {})
-                text = _extract_text_from_content(content)
-                tdlib_fid, media_type = _extract_tdlib_file(content)
-
-                msg_datetime_utc = (
-                    datetime.fromtimestamp(date, tz=timezone.utc) if date
-                    else datetime.now(timezone.utc)
-                )
-                timestamp_iso = msg_datetime_utc.isoformat()
-
-                # Resolve author: for private chats chat_id == the other user
-                sender = msg_d.get("sender_id", {})
-                author_id = (
-                    sender.get("user_id") if isinstance(sender, dict) else
-                    getattr(sender, "user_id", None)
-                ) or chat_id
-
-                # Skip messages from bots
-                if await self._is_bot_user(author_id):
-                    logger.debug("Skipping message from bot user_id=%d", author_id)
-                    return
-
-                # Register new user if needed
-                user_in_db = usersdb_cls.get(user_id=author_id)
-                if user_in_db is None:
-                    resolved_name = await self._get_user_fullname(author_id)
-                    usersdb_cls.add(user_id=author_id, user_fullname=resolved_name)
-                    logger.info("New user tracked via TDLib: user_id=%d name=%s", author_id, resolved_name)
-                    try:
-                        msg_text = new_user_fmt.format(
-                            user_fullname_escaped=escape(resolved_name),
-                            user_id=author_id,
-                        )
-                        await aiogram_bot.send_message(notify_user_id, msg_text, parse_mode="html")
-                    except Exception as e:
-                        logger.warning("Failed to send new-user notification: %s", e)
-
-                # Save to DB (store tdlib_fid as string in file_id column)
-                messagesx_cls.add(
-                    user_id=author_id,
-                    message_id=message_id,
-                    message_text=text,
-                    timestamp=timestamp_iso,
-                    file_id=str(tdlib_fid) if tdlib_fid else None,
-                    media_type=media_type,
-                )
-                logger.debug("Saved message chat_id=%d msg_id=%d media=%s", chat_id, message_id, media_type)
-
-                # Self-destruct: forward immediately before it disappears
-                if _is_self_destruct(msg_d):
-                    logger.info("🔥 Self-destructing message from chat_id=%d — forwarding now", chat_id)
-                    user_in_db2 = usersdb_cls.get(user_id=author_id)
-                    if isinstance(user_in_db2, dict):
-                        fullname = user_in_db2.get("user_fullname") or await self._get_user_fullname(author_id)
-                    elif user_in_db2:
-                        fullname = getattr(user_in_db2, "user_fullname", None) or await self._get_user_fullname(author_id)
-                    else:
-                        fullname = await self._get_user_fullname(author_id)
-                    await _forward_self_destruct(msg_d, fullname, author_id)
-
+                async with change_lock:
+                    if await self._is_bot_user(author_id):
+                        return
+                    text, media_type = display_text(message.get("content") or {})
+                    date = message.get("date")
+                    stamp = datetime.fromtimestamp(date, tz=timezone.utc) if isinstance(date, (int, float)) else datetime.now(timezone.utc)
+                    # Name lookup is only performed after allowlist approval.
+                    name = await self._get_user_fullname(author_id)
+                    added = messagesx_cls.add(
+                        chat_id=chat_id, message_id=msg_id, author_id=author_id,
+                        author_name=name, message_text=text,
+                        timestamp=stamp.isoformat(), media_type=media_type,
+                    )
+                    if added:
+                        logger.info("Stored message chat=%s msg=%s", chat_id, msg_id)
             except Exception:
-                logger.exception("Error in _on_new_message")
+                logger.warning("on_new_message failed")
 
-        # ── updateMessageEdited ───────────────
+        async def process_changed(update, *, new_content=None):
+            try:
+                d = _as_dict(update)
+                chat_id = getattr(update, "chat_id", None) or d.get("chat_id")
+                msg_id = getattr(update, "message_id", None) or d.get("message_id")
+                if not permitted(chat_id) or not isinstance(msg_id, int) or not msg_id:
+                    return
+                async with change_lock:
+                    record = messagesx_cls.get(chat_id=chat_id, message_id=msg_id)
+                    if record is None:
+                        return
+                    if new_content is None:
+                        raw_msg = await self._raw_request({
+                            "@type": "getMessage", "chat_id": chat_id,
+                            "message_id": msg_id,
+                        })
+                        if raw_msg.get("@type") == "error":
+                            return
+                        new_content = raw_msg.get("content")
+                    if new_content is None:
+                        return
+                    new_text, kind = display_text(new_content)
+                    if new_text == record.message_text and kind == record.media_type:
+                        return  # edit-date and content updates can repeat
+                    await notify(chat_id=chat_id, old=record.message_text,
+                                 new=new_text, record=record)
+                    messagesx_cls.update(chat_id=chat_id, message_id=msg_id,
+                                         message_text=new_text, media_type=kind)
+                    logger.info("Message edited chat=%s msg=%s", chat_id, msg_id)
+            except Exception:
+                logger.warning("process_changed failed")
+
         @client.on_event(API.Types.UPDATE_MESSAGE_EDITED)
-        async def _on_message_edited(c: Client, update):
-            """
-            updateMessageEdited has chat_id + message_id but NO new content.
-            We call getMessage to retrieve the updated message.
-            """
-            try:
-                data = update.data if hasattr(update, "data") else {}
-                chat_id = getattr(update, "chat_id", None) or data.get("chat_id")
-                message_id = getattr(update, "message_id", None) or data.get("message_id")
+        async def on_edited(_client, update):
+            await process_changed(update)
 
-                if not chat_id or not message_id or chat_id <= 0:
-                    return
-                if watched_chat_ids and chat_id not in watched_chat_ids:
-                    return
+        # TDLib often publishes actual text changes as updateMessageContent.
+        content_update_type = getattr(API.Types, "UPDATE_MESSAGE_CONTENT", None)
+        if content_update_type is not None:
+            @client.on_event(content_update_type)
+            async def on_content_changed(_client, update):
+                d = _as_dict(update)
+                content = getattr(update, "new_content", None)
+                if content is None:
+                    content = d.get("new_content")
+                await process_changed(update, new_content=content)
+        else:
+            logger.warning("UPDATE_MESSAGE_CONTENT is unavailable in aiotdlib; edit coverage may be limited")
 
-                user_msg = messagesx_cls.get(user_id=chat_id, message_id=message_id)
-                if user_msg is None:
-                    logger.debug("updateMessageEdited: no record for chat_id=%d msg_id=%d", chat_id, message_id)
-                    return
-
-                # Fetch updated content
-                raw_msg = await self._raw_request({
-                    "@type": "getMessage",
-                    "chat_id": chat_id,
-                    "message_id": message_id,
-                })
-                if raw_msg.get("@type") == "error":
-                    logger.warning("getMessage failed: %s", raw_msg.get("message"))
-                    return
-
-                new_content = raw_msg.get("content", {})
-                new_text = _extract_text_from_content(new_content)
-                new_tdlib_fid, new_media_type = _extract_tdlib_file(new_content)
-
-                user_in_db = usersdb_cls.get(user_id=chat_id)
-                if isinstance(user_in_db, dict):
-                    user_fullname = user_in_db.get("user_fullname") or await self._get_user_fullname(chat_id)
-                elif user_in_db:
-                    user_fullname = getattr(user_in_db, "user_fullname", None) or await self._get_user_fullname(chat_id)
-                else:
-                    user_fullname = await self._get_user_fullname(chat_id)
-
-                message_timestamp = (
-                    __import__("datetime").datetime
-                    .fromisoformat(user_msg.timestamp)
-                    .astimezone(timezone_local)
-                )
-                timestamp_formatted = message_timestamp.strftime("%d/%m/%y %H:%M")
-
-                # Use new file if available, otherwise fall back to stored one
-                tdlib_fid = new_tdlib_fid or (int(user_msg.file_id) if user_msg.file_id else None)
-                media_type = new_media_type if new_tdlib_fid else user_msg.media_type
-
-                await _send_notification(
-                    message_old=user_msg.message_text,
-                    message_new=new_text,
-                    user_fullname=user_fullname,
-                    user_id=chat_id,
-                    timestamp=timestamp_formatted,
-                    tdlib_file_id=tdlib_fid,
-                    media_type=media_type,
-                )
-
-                messagesx_cls.update(
-                    user_id=chat_id,
-                    message_id=message_id,
-                    message_text=new_text,
-                    file_id=str(new_tdlib_fid) if new_tdlib_fid else user_msg.file_id,
-                    media_type=media_type,
-                )
-                logger.debug("Edit recorded chat_id=%d msg_id=%d", chat_id, message_id)
-
-            except Exception:
-                logger.exception("Error in _on_message_edited")
-
-        # ── updateDeleteMessages ──────────────
         @client.on_event(API.Types.UPDATE_DELETE_MESSAGES)
-        async def _on_messages_deleted(c: Client, update):
-            """
-            Only process is_permanent=True (skip cache-purge noise).
-            """
+        async def on_deleted(_client, update):
             try:
-                data = update.data if hasattr(update, "data") else {}
-                chat_id = getattr(update, "chat_id", None) or data.get("chat_id")
-                message_ids = getattr(update, "message_ids", None) or data.get("message_ids", [])
-                is_permanent = getattr(update, "is_permanent", None)
-                if is_permanent is None:
-                    is_permanent = data.get("is_permanent", True)
-
-                if not chat_id or chat_id <= 0:
+                d = _as_dict(update)
+                chat_id = getattr(update, "chat_id", None) or d.get("chat_id")
+                if not permitted(chat_id):
                     return
-                if watched_chat_ids and chat_id not in watched_chat_ids:
-                    return
-                if not is_permanent:
-                    return
-
-                user_in_db = usersdb_cls.get(user_id=chat_id)
-                if isinstance(user_in_db, dict):
-                    user_fullname = user_in_db.get("user_fullname") or await self._get_user_fullname(chat_id)
-                elif user_in_db:
-                    user_fullname = getattr(user_in_db, "user_fullname", None) or await self._get_user_fullname(chat_id)
-                else:
-                    user_fullname = await self._get_user_fullname(chat_id)
-
-                for msg_id in message_ids:
-                    user_msg = messagesx_cls.get(user_id=chat_id, message_id=msg_id)
-                    if user_msg is None:
-                        continue
-
-                    message_timestamp = (
-                        __import__("datetime").datetime
-                        .fromisoformat(user_msg.timestamp)
-                        .astimezone(timezone_local)
-                    )
-                    timestamp_formatted = message_timestamp.strftime("%d/%m/%y %H:%M")
-                    tdlib_fid = int(user_msg.file_id) if user_msg.file_id else None
-
-                    await _send_notification(
-                        message_old=user_msg.message_text,
-                        message_new=None,
-                        user_fullname=user_fullname,
-                        user_id=chat_id,
-                        timestamp=timestamp_formatted,
-                        tdlib_file_id=tdlib_fid,
-                        media_type=user_msg.media_type,
-                    )
-                    messagesx_cls.delete(user_id=chat_id, message_id=msg_id)
-                    logger.debug("Deletion recorded chat_id=%d msg_id=%d", chat_id, msg_id)
-
+                permanent = getattr(update, "is_permanent", None)
+                if permanent is None:
+                    permanent = d.get("is_permanent")
+                if permanent is not True:
+                    return  # uncertain/cache-only deletions are ignored
+                ids = getattr(update, "message_ids", None)
+                if ids is None:
+                    ids = d.get("message_ids", [])
+                async with change_lock:
+                    for msg_id in ids or []:
+                        if not isinstance(msg_id, int):
+                            continue
+                        record = messagesx_cls.get(chat_id=chat_id, message_id=msg_id)
+                        if record is None:
+                            continue
+                        await notify(chat_id=chat_id, old=record.message_text,
+                                     new=None, record=record)
+                        messagesx_cls.delete(chat_id=chat_id, message_id=msg_id)
+                        logger.info("Message deleted chat=%s msg=%s", chat_id, msg_id)
             except Exception:
-                logger.exception("Error in _on_messages_deleted")
+                logger.warning("on_deleted failed")
 
-        logger.info("Message tracking handlers registered on TDLib client")
+        logger.info("Registered safe TDLib handlers for %d allowed chats", len(allowed))
 
 
 # ─────────────────────────────────────────────

@@ -1,6 +1,25 @@
+# Secrets and Telegram session data. Never commit these.
 /config.ini
+.env
+*.session
+*.session-journal
+/.aiotdlib/
+/tdlib_data/
+/tdlib_files/
+# Message storage / SQLite journals.
 /users.db
 /messages.db
-.aiotdlib
-__pycache__
-venv
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+# Python / local runtime
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.log
+
+# Isolated test runtime; never commit sessions or backups
+/.chat-monitor-test/
+*.backup
