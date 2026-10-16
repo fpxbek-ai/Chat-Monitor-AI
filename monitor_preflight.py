@@ -43,8 +43,8 @@ def main() -> int:
     owner_id = _positive_int(config.get('telegram', 'user_id', fallback=''))
     test_id = _positive_int(config.get('monitor', 'test_user_id', fallback=''))
     check('Notification recipient ID set', bool(owner_id), 'Set [telegram] user_id to your bot notification recipient ID.')
-    check('Separate test account ID set', bool(test_id) and test_id != owner_id,
-          'Set [monitor] test_user_id to the OTHER Telegram account ID (not the notification recipient).')
+    check('Test account ID set', bool(test_id),
+          'Set [monitor] test_user_id to the numerical ID of the TEST account that will scan the QR code.')
 
     raw_chats = config.get('monitor', 'chat_ids', fallback='').strip().strip('"').strip("'")
     items = [s.strip() for s in raw_chats.split(',') if s.strip()]
