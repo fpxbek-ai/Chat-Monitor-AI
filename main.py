@@ -18,29 +18,30 @@ logger = logging.getLogger("chat_monitor")
 logging.basicConfig(level=logging.INFO)
 
 
-def read_settings():
-    config = configparser.ConfigParser()
+def read_settings(*, discovery=False):
+    config = configparser.ConfigParser(interpolation=None)
     if not config.read("config.ini"):
         raise RuntimeError("config.ini not found. Keep it local and out of Git.")
     user_id = int(config["telegram"]["user_id"].strip('"'))
     timezone_name = config.get("timezone", "name", fallback="Asia/Tashkent").strip('"')
     tz = pytz.timezone(timezone_name)
-    chat_ids = parse_chat_ids(config.get("monitor", "chat_ids", fallback=""))
+    chat_ids = set() if discovery else parse_chat_ids(config.get("monitor", "chat_ids", fallback=""))
     return config, user_id, tz, chat_ids
 
 
-def build_router(owner_id: int) -> Router:
+def build_router(owner_id: int, test_user_id: int = 0) -> Router:
     router = Router(name="chat_monitor_private_commands")
+    allowed_users = {uid for uid in (owner_id, test_user_id) if uid > 0}
 
     @router.message(Command("start"))
     async def start_command(message: types.Message):
-        if not message.from_user or message.from_user.id != owner_id:
+        if not message.from_user or message.from_user.id not in allowed_users:
             return
-        await message.answer("Chat Monitor AI v0.3. Use /chatid in your test group.")
+        await message.answer("Бот работает. В тестовой группе отправьте /chatid или /id с вашего разрешённого аккаунта.")
 
-    @router.message(Command("chatid"))
+    @router.message(Command("chatid", "id"))
     async def chatid_command(message: types.Message):
-        if not message.from_user or message.from_user.id != owner_id:
+        if not message.from_user or message.from_user.id not in allowed_users:
             return
         await message.answer(
             f"Chat ID (TDLib test candidate): <code>{message.chat.id}</code>\n"
@@ -50,11 +51,12 @@ def build_router(owner_id: int) -> Router:
     return router
 
 
-async def chat_id_only(bot: Bot, owner_id: int) -> None:
+async def chat_id_only(bot: Bot, owner_id: int, test_user_id: int = 0) -> None:
     dp = Dispatcher()
-    dp.include_router(build_router(owner_id))
-    await bot.delete_webhook(drop_pending_updates=True)
-    print("CHAT-ID MODE: Add the bot to your TEST group and send /chatid.", flush=True)
+    dp.include_router(build_router(owner_id, test_user_id))
+    await bot.delete_webhook(drop_pending_updates=False)
+    me = await bot.get_me()
+    print(f"CHAT-ID MODE READY: @{me.username}; send /chatid@{me.username} in your TEST group. Keep this process running.", flush=True)
     await dp.start_polling(bot)
 
 
@@ -94,14 +96,14 @@ async def monitor(bot: Bot, config, owner_id: int, tz, chat_ids: set[int]) -> No
         )
 
     dp = Dispatcher()
-    dp.include_router(build_router(owner_id))
+    dp.include_router(build_router(owner_id, expected_id))
     logger.info("Tracking only explicitly allowed chat IDs: %s", sorted(chat_ids))
     try:
         await userbot.start(use_qr=(mode != "code"), on_client_created=register_handlers)
     except BaseException:
         await userbot.stop()
         raise
-    await bot.delete_webhook(drop_pending_updates=True)
+    await bot.delete_webhook(drop_pending_updates=False)
 
     async def cleanup():
         while True:
@@ -121,11 +123,11 @@ async def main():
     if "--chat-id-only" not in sys.argv and not all(flag in sys.argv for flag in ("--run-test-monitor", "--authorize-test-account")):
         print("SAFE MODE: Telegram is not started. Explicit test-run and authorization flags required.")
         return
-    config, owner_id, tz, chat_ids = read_settings()
+    config, owner_id, tz, chat_ids = read_settings(discovery="--chat-id-only" in sys.argv)
     token = os.environ["CHAT_MONITOR_BOT_TOKEN"]
     async with Bot(token=token) as bot:
         if "--chat-id-only" in sys.argv:
-            await chat_id_only(bot, owner_id)
+            await chat_id_only(bot, owner_id, int(config.get("monitor", "test_user_id", fallback="0").strip(chr(34))))
         else:
             if not chat_ids:
                 print("SAFE MODE: no monitored chat IDs. Use python main.py --chat-id-only first.")
