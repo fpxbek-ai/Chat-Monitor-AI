@@ -25,7 +25,8 @@ def read_settings(*, discovery=False):
     user_id = int(config["telegram"]["user_id"].strip('"'))
     timezone_name = config.get("timezone", "name", fallback="Asia/Tashkent").strip('"')
     tz = pytz.timezone(timezone_name)
-    chat_ids = set() if discovery else parse_chat_ids(config.get("monitor", "chat_ids", fallback=""))
+    all_chats = config.getboolean("monitor", "all_chats", fallback=False)
+    chat_ids = set() if discovery or all_chats else parse_chat_ids(config.get("monitor", "chat_ids", fallback=""))
     return config, user_id, tz, chat_ids
 
 
@@ -63,9 +64,10 @@ async def chat_id_only(bot: Bot, owner_id: int, test_user_id: int = 0) -> None:
 async def monitor(bot: Bot, config, owner_id: int, tz, chat_ids: set[int]) -> None:
     from tdlib_userbot import init_userbot
 
-    if not chat_ids:
+    all_chats = config.getboolean("monitor", "all_chats", fallback=False)
+    if not chat_ids and not all_chats:
         raise RuntimeError("No [monitor] chat_ids configured: monitoring is disabled (safe default).")
-    if len(chat_ids) != 1 or next(iter(chat_ids)) >= 0:
+    if not all_chats and (len(chat_ids) != 1 or next(iter(chat_ids)) >= 0):
         raise RuntimeError("Exactly one test group is required")
     expected_id = config.getint("monitor", "test_user_id", fallback=0)
     if expected_id <= 0:
@@ -80,7 +82,9 @@ async def monitor(bot: Bot, config, owner_id: int, tz, chat_ids: set[int]) -> No
     password = os.environ.get("CHAT_MONITOR_TEST_PASSWORD", "")
     mode = tdlib_cfg.get("auth_mode", "qr").strip('"').lower()
 
+    os.umask(0o077)
     store = MessageStore("messages.db")
+    bot_identity = await bot.get_me()
     userbot = init_userbot(api_id, api_hash, phone, password, path)
     userbot.expected_test_user_id = expected_id
 
@@ -93,13 +97,16 @@ async def monitor(bot: Bot, config, owner_id: int, tz, chat_ids: set[int]) -> No
             timezone_local=tz,
             messagesx_cls=store,
             watched_chat_ids=chat_ids,
+            all_chats=all_chats,
+            excluded_chat_ids={777000, bot_identity.id},
         )
 
     dp = Dispatcher()
     dp.include_router(build_router(owner_id, expected_id))
-    logger.info("Tracking only explicitly allowed chat IDs: %s", sorted(chat_ids))
+    logger.info("Tracking scope: %s", "all test-account chats" if all_chats else sorted(chat_ids))
     try:
-        await userbot.start(use_qr=(mode != "code"), on_client_created=register_handlers)
+        await userbot.start(use_qr=(mode != "code"), on_client_created=register_handlers,
+                            allow_authorization="--authorize-test-account" in sys.argv)
     except BaseException:
         await userbot.stop()
         raise
@@ -120,7 +127,7 @@ async def monitor(bot: Bot, config, owner_id: int, tz, chat_ids: set[int]) -> No
 
 
 async def main():
-    if "--chat-id-only" not in sys.argv and not all(flag in sys.argv for flag in ("--run-test-monitor", "--authorize-test-account")):
+    if "--chat-id-only" not in sys.argv and not ("--run-test-monitor" in sys.argv and any(flag in sys.argv for flag in ("--authorize-test-account", "--resume-test-account"))):
         print("SAFE MODE: Telegram is not started. Explicit test-run and authorization flags required.")
         return
     config, owner_id, tz, chat_ids = read_settings(discovery="--chat-id-only" in sys.argv)
@@ -129,7 +136,7 @@ async def main():
         if "--chat-id-only" in sys.argv:
             await chat_id_only(bot, owner_id, int(config.get("monitor", "test_user_id", fallback="0").strip(chr(34))))
         else:
-            if not chat_ids:
+            if not chat_ids and not config.getboolean("monitor", "all_chats", fallback=False):
                 print("SAFE MODE: no monitored chat IDs. Use python main.py --chat-id-only first.")
                 return
             await monitor(bot, config, owner_id, tz, chat_ids)

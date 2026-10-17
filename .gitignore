@@ -23,3 +23,5 @@ venv/
 # Isolated test runtime; never commit sessions or backups
 /.chat-monitor-test/
 *.backup
+
+.chat-monitor.lock

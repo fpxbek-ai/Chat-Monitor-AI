@@ -348,6 +348,10 @@ class TdlibUserbot:
             import sys
             state_id = getattr(authorization_state, "ID", type(authorization_state).__name__)
             logger.info("TDLib auth state: %s", state_id)
+            if getattr(self, "_resume_only", False) and state_id in {"authorizationStateWaitPhoneNumber", "authorizationStateWaitCode", "authorizationStateWaitPassword", "authorizationStateWaitOtherDeviceConfirmation", "authorizationStateWaitEmailAddress", "authorizationStateWaitEmailCode", "authorizationStateWaitRegistration"}:
+                if not self._auth_needed.done():
+                    self._auth_needed.set_result(True)
+                return
 
             # QR mode: intercept phone-number request → switch to QR auth
             if use_qr and state_id == "authorizationStateWaitPhoneNumber":
@@ -403,7 +407,7 @@ class TdlibUserbot:
         sys.stdout.write("⏳ QR refreshes automatically every ~30s. Scan whenever ready.\n")
         sys.stdout.flush()
 
-    async def start(self, use_qr: bool = True, on_client_created=None) -> None:
+    async def start(self, use_qr: bool = True, on_client_created=None, allow_authorization=True) -> None:
         """Start TDLib client (triggers auth on first run).
 
         Args:
@@ -416,8 +420,24 @@ class TdlibUserbot:
         if on_client_created is not None:
             on_client_created()  # Set allowlist handlers before authentication.
         self._patch_auth_input(use_qr=use_qr)
+        self._resume_only = not allow_authorization
+        self._auth_needed = asyncio.get_running_loop().create_future()
         self._ctx = self.client.__aenter__()
-        await self._ctx
+        entering = asyncio.create_task(self._ctx)
+        try:
+            if self._resume_only:
+                done, _ = await asyncio.wait({entering, self._auth_needed}, timeout=45,
+                                             return_when=asyncio.FIRST_COMPLETED)
+                if self._auth_needed in done:
+                    raise RuntimeError("TEST_LOGIN_REQUIRED: authorize the test account interactively")
+                if entering not in done:
+                    raise RuntimeError("TEST_SESSION_TIMEOUT: no ready session within 45 seconds")
+            await entering
+        finally:
+            if not entering.done():
+                entering.cancel()
+                await asyncio.gather(entering, return_exceptions=True)
+            self._auth_needed.cancel()
         me = await self.client.api.get_me()
         if me.id != self.expected_test_user_id:
             await self.stop()
@@ -593,6 +613,8 @@ class TdlibUserbot:
         timezone_local,
         messagesx_cls,
         watched_chat_ids: Set[int] | None = None,
+        all_chats: bool = False,
+        excluded_chat_ids: Set[int] | None = None,
     ) -> None:
         """Monitor explicitly allowed chats only.
 
@@ -607,7 +629,8 @@ class TdlibUserbot:
         if client is None:
             raise RuntimeError("Call after TDLib Client creation")
         allowed = frozenset(watched_chat_ids or ())
-        if not allowed:
+        excluded = frozenset(excluded_chat_ids or ()) | {777000}
+        if not allowed and not all_chats:
             logger.warning("No allowed chat IDs; all message updates will be ignored")
 
         # Both updateMessageEdited and updateMessageContent may occur for a
@@ -615,7 +638,8 @@ class TdlibUserbot:
         change_lock = asyncio.Lock()
 
         def permitted(chat_id) -> bool:
-            return self._tracking_ready and type(chat_id) is int and chat_id in allowed
+            return (self._tracking_ready and type(chat_id) is int and chat_id != 0
+                    and chat_id not in excluded and (all_chats or chat_id in allowed))
 
         def display_text(content) -> tuple[str, str]:
             text = _extract_text_from_content(content)
@@ -628,6 +652,9 @@ class TdlibUserbot:
             sender = _as_dict(msg.get("sender_id"))
             # TDLib represents user senders as messageSenderUser.
             kind = sender.get("@type") or sender.get("ID")
+            if all_chats and kind == "messageSenderChat":
+                sender_chat = sender.get("chat_id")
+                return sender_chat if type(sender_chat) is int and sender_chat < 0 else None
             if kind and kind != "messageSenderUser":
                 return None  # chat/anonymous sender: never misattribute
             uid = sender.get("user_id")
@@ -681,13 +708,14 @@ class TdlibUserbot:
                     logger.debug("Ignoring non-user sender in chat %s", chat_id)
                     return
                 async with change_lock:
-                    if await self._is_bot_user(author_id):
+                    if author_id > 0 and not all_chats and await self._is_bot_user(author_id):
                         return
                     text, media_type = display_text(message.get("content") or {})
                     date = message.get("date")
                     stamp = datetime.fromtimestamp(date, tz=timezone.utc) if isinstance(date, (int, float)) else datetime.now(timezone.utc)
                     # Name lookup is only performed after allowlist approval.
-                    name = await self._get_user_fullname(author_id)
+                    name = (await self._get_user_fullname(author_id) if author_id > 0
+                            else f"Chat sender {author_id}")
                     added = messagesx_cls.add(
                         chat_id=chat_id, message_id=msg_id, author_id=author_id,
                         author_name=name, message_text=text,
@@ -776,7 +804,7 @@ class TdlibUserbot:
             except Exception:
                 logger.warning("on_deleted failed")
 
-        logger.info("Registered safe TDLib handlers for %d allowed chats", len(allowed))
+        logger.info("Registered TDLib handlers; scope=%s", "all chats" if all_chats else len(allowed))
 
 
 # ─────────────────────────────────────────────
