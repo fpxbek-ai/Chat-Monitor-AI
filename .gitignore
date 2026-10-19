@@ -25,3 +25,6 @@ venv/
 *.backup
 
 .chat-monitor.lock
+/accounts.ini
+/.chat-monitor-accounts/
+

@@ -266,6 +266,8 @@ class TdlibUserbot:
         phone_number: str,
         password: str,
         tdjson_path: str,
+        *,
+        session_directory: str | None = None,
     ):
         self._settings = ClientSettings(
             api_id=api_id,
@@ -273,7 +275,7 @@ class TdlibUserbot:
             phone_number=phone_number,
             library_path=tdjson_path,
             password=password,
-            files_directory=os.path.abspath(".chat-monitor-test"),
+            files_directory=os.path.abspath(session_directory or ".chat-monitor-test"),
             use_secret_chats=False,
             use_message_database=False,
             use_chat_info_database=False,
@@ -830,3 +832,4 @@ def get_userbot() -> TdlibUserbot:
     if _userbot is None:
         raise RuntimeError("TDLib userbot not initialized. Call init_userbot() first.")
     return _userbot
+

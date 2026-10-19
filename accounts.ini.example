@@ -1,0 +1,26 @@
+[tdlib]
+tdjson_path = /absolute/path/to/libtdjson.so
+
+# Copy to accounts.ini. Replace each 0 with the corresponding Telegram user ID.
+# Remove unused sections: one to three accounts are supported.
+# Each user must first open the bot in a private chat and press Start.
+[account:first]
+user_id = 0
+enabled = true
+all_chats = true
+timezone = Asia/Tashkent
+auth_mode = qr
+
+[account:second]
+user_id = 0
+enabled = true
+all_chats = true
+timezone = Asia/Tashkent
+auth_mode = qr
+
+[account:third]
+user_id = 0
+enabled = true
+all_chats = true
+timezone = Asia/Tashkent
+auth_mode = qr
